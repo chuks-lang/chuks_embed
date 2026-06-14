@@ -7,5 +7,6 @@
   "license": "MIT",
   "keywords": ["embedding", "vector", "ai", "parallel", "batch", "openai", "cohere", "ollama", "rag", "semantic-search"],
   "repository": "https://github.com/chuks-lang/chuks_embed",
+  "declaredDomains": ["api.openai.com", "api.cohere.ai"],
   "dependencies": {}
 }
