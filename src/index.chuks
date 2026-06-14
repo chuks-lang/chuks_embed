@@ -249,6 +249,22 @@ function _resolveConfig(config: EmbedConfig): ResolvedConfig {
 // ─── Provider API Calls ─────────────────────────────────────────
 // Top-level async functions so they can be used with spawn.
 
+// Convert a provider's raw embedding (a JSON []any of numbers) into a typed
+// []float, so callers receive a real []float rather than a []any. This matters
+// for dynamic dispatch into typed-slice params (e.g. chuks_vector's
+// upsert(vec: []float)), and is simply the correct type for an embedding.
+function _toFloatVec(raw: any): []float {
+    var out: []float = []
+    var i: int = 0
+    var n: int = raw.length
+    while (i < n) {
+        var f: float = raw[i]
+        out.push(f)
+        i = i + 1
+    }
+    return out
+}
+
 async function _callOpenAI(texts: []any, resolved: ResolvedConfig): Task<EmbedResponse> {
     var payload: any = {
         "model": resolved.model,
@@ -279,7 +295,7 @@ async function _callOpenAI(texts: []any, resolved: ResolvedConfig): Task<EmbedRe
     var n: int = rows.length
     var i: int = 0
     while (i < n) {
-        vectors.push(rows[i].embedding)
+        vectors.push(_toFloatVec(rows[i].embedding))
         i = i + 1
     }
 
@@ -322,7 +338,7 @@ async function _callCohere(texts: []any, resolved: ResolvedConfig): Task<EmbedRe
     var n: int = rows.length
     var i: int = 0
     while (i < n) {
-        vectors.push(rows[i])
+        vectors.push(_toFloatVec(rows[i]))
         i = i + 1
     }
 
@@ -363,7 +379,7 @@ async function _callOllama(texts: []any, resolved: ResolvedConfig): Task<EmbedRe
     var n: int = rows.length
     var i: int = 0
     while (i < n) {
-        vectors.push(rows[i])
+        vectors.push(_toFloatVec(rows[i]))
         i = i + 1
     }
 
