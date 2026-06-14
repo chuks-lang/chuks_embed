@@ -1,6 +1,6 @@
 {
   "name": "@chuks/embed",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "High-throughput embedding engine for Chuks, batch parallel embedding across CPU cores with OpenAI, Cohere, and Ollama providers",
   "entry": "src/index.chuks",
   "author": "Chuks Team",
