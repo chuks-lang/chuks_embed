@@ -1,0 +1,101 @@
+// Live integration test for @chuks/embed against a local Ollama server.
+//
+// Exercises the REAL network path (single / batch / batchParallel / search)
+// end to end, which the offline unit suite (index.test.chuks) does not cover.
+//
+// Requires:
+//   ollama serve              (http://localhost:11434)
+//   ollama pull nomic-embed-text
+//
+// If Ollama is not reachable the suite SKIPS (0 failures) so CI without a
+// local model never goes red.
+
+import { test } from "std/test"
+import { embed } from "../src/index.chuks"
+
+var passed: int = 0
+var failed: int = 0
+var failures: []string = []
+
+const MODEL: string = "nomic-embed-text"
+const DIMS: int = 768
+
+function pass(label: string): void {
+    passed = passed + 1
+    println("  PASS: " + label)
+}
+
+function fail(label: string, detail: string): void {
+    failed = failed + 1
+    failures.push("FAIL: " + label + " — " + detail)
+    println("  FAIL: " + label + " — " + detail)
+}
+
+// Probe: is Ollama up with the embed model? Returns true if a real vector came back.
+async function ollamaReady(): Task<bool> {
+    var vec: any = await embed.single("ping", { model: MODEL })
+    if (vec == null) { return false }
+    if (vec.length == 0) { return false }
+    return true
+}
+
+async function testSingle(): Task<void> {
+    var vec: any = await embed.single("hello world", { model: MODEL })
+    if (vec == null) { fail("single", "returned null"); return }
+    if (vec.length == DIMS) { pass("single: 768-dim vector from Ollama") }
+    else { fail("single: dims", "expected " + string(DIMS) + ", got " + string(vec.length)) }
+    return
+}
+
+async function testBatch(): Task<void> {
+    var res = await embed.batch(["the cat sat", "a dog ran", "stock market crash"], { model: MODEL })
+    if (res.vectors.length == 3) { pass("batch: 3 vectors returned") }
+    else { fail("batch: count", "expected 3, got " + string(res.vectors.length)) }
+    if (res.dimensions == DIMS) { pass("batch: dimensions = 768") }
+    else { fail("batch: dimensions", "expected 768, got " + string(res.dimensions)) }
+    return
+}
+
+async function testBatchParallel(): Task<void> {
+    var docs: []any = ["alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta", "theta"]
+    var res = await embed.batchParallel(docs, { model: MODEL })
+    if (res.vectors.length == 8) { pass("batchParallel: 8 vectors across workers") }
+    else { fail("batchParallel: count", "expected 8, got " + string(res.vectors.length)) }
+    return
+}
+
+// Semantic correctness: a paraphrase should rank the matching sentence first.
+async function testSearchSemantic(): Task<void> {
+    var docs: []any = ["the cat sat on the mat", "the stock market crashed today", "rockets launch into space"]
+    var hits: []any = await embed.search("a feline rested on a rug", docs, { model: MODEL })
+    if (hits.length == 0) { fail("search", "no hits"); return }
+    var top: any = hits[0]
+    if (top.index == 0) { pass("search: paraphrase ranks the cat sentence #1") }
+    else { fail("search: ranking", "expected index 0 first, got " + string(top.index)) }
+    if (top.score > 0.5) { pass("search: top score is a strong match (> 0.5)") }
+    else { fail("search: score", "expected > 0.5, got " + string(top.score)) }
+    return
+}
+
+async function main(): Task<void> {
+    var start: int = test.now()
+    println("@chuks/embed — live Ollama integration")
+    println("══════════════════════════════════════════")
+
+    var ready: bool = await ollamaReady()
+    if (!ready) {
+        println("\n  SKIP: Ollama not reachable at http://localhost:11434 with model '" + MODEL + "'.")
+        println("        Run `ollama serve` and `ollama pull " + MODEL + "` to enable this suite.")
+        println("══════════════════════════════════════════")
+        test.report(passed, failed, failures, test.now() - start)
+        return
+    }
+
+    println("\n── single ──");          await testSingle()
+    println("\n── batch ──");           await testBatch()
+    println("\n── batchParallel ──");   await testBatchParallel()
+    println("\n── search (semantic) ──"); await testSearchSemantic()
+
+    println("══════════════════════════════════════════")
+    test.report(passed, failed, failures, test.now() - start)
+}

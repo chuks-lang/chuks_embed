@@ -1,0 +1,772 @@
+// ┌─────────────────────────────────────────────────────────────────┐
+// │  chuks_embed — High-Throughput Embedding Engine                 │
+// │                                                                 │
+// │  Batch embedding generation with true parallel processing.      │
+// │  On a 16-core machine, 16 API calls happen simultaneously.      │
+// │                                                                 │
+// │  Providers: OpenAI, Cohere, Ollama (auto-resolved from model).  │
+// │  Built on Chuks native spawn + typed channels for parallelism.  │
+// └─────────────────────────────────────────────────────────────────┘
+
+import { http } from "std/http"
+import { json } from "std/json"
+import { Channel } from "std/channel"
+import { time } from "std/time"
+import { dotenv } from "std/dotenv"
+import { strings } from "std/strings"
+
+// ─── Config Type ────────────────────────────────────────────────
+// Public options object. Every field is optional except `model`.
+// Passed as a nullable param so AOT hydrates the map literal.
+dataType EmbedConfig {
+    model: string;
+    provider: string?;
+    apiKey: string?;
+    baseUrl: string?;
+    batchSize: int?;
+    workers: int?;
+    dimensions: int?;
+    inputType: string?;
+    topK: int?;
+    onProgress: ((int, int) => void)?;
+}
+
+// Internal fully-resolved configuration. All fields populated.
+dataType ResolvedConfig {
+    provider: string;
+    model: string;
+    apiKey: string;
+    baseUrl: string;
+    batchSize: int;
+    workers: int;
+    dimensions: int;     // 0 = no override
+    inputType: string;
+}
+
+// ─── Result Types ───────────────────────────────────────────────
+
+dataType EmbeddingResult {
+    vectors: []any;
+    model: string;
+    dimensions: int;
+    totalTokens: int;
+}
+
+dataType BatchResult {
+    vectors: []any;
+    model: string;
+    dimensions: int;
+    totalTokens: int;
+    batchCount: int;
+    duration: int;
+}
+
+// One provider call's outcome (vectors + token usage).
+dataType EmbedResponse {
+    vectors: []any;
+    tokens: int;
+}
+
+// A worker's batch result carried over the typed channel.
+dataType WorkerMsg {
+    index: int;
+    vectors: []any;
+    tokens: int;
+}
+
+// A single search hit.
+dataType SearchHit {
+    index: int;
+    score: float;
+}
+
+// ─── Dimension Lookup ───────────────────────────────────────────
+
+function _getDimensions(model: string): int {
+    if (model == "text-embedding-3-small") { return 1536 }
+    if (model == "text-embedding-3-large") { return 3072 }
+    if (model == "text-embedding-ada-002") { return 1536 }
+    if (model == "embed-english-v3.0") { return 1024 }
+    if (model == "embed-multilingual-v3.0") { return 1024 }
+    if (model == "embed-english-light-v3.0") { return 384 }
+    if (model == "embed-multilingual-light-v3.0") { return 384 }
+    if (model == "nomic-embed-text") { return 768 }
+    if (model == "mxbai-embed-large") { return 1024 }
+    if (model == "all-minilm") { return 384 }
+    if (model == "snowflake-arctic-embed") { return 1024 }
+    return 0
+}
+
+// ─── String Helpers ─────────────────────────────────────────────
+
+// Strip provider prefix ("openai/model" → "model")
+function _stripPrefix(model: string): string {
+    if (strings.startsWith(model, "openai/")) {
+        var parts: []string = strings.split(model, "/")
+        return parts[1]
+    }
+    if (strings.startsWith(model, "cohere/")) {
+        var parts2: []string = strings.split(model, "/")
+        return parts2[1]
+    }
+    if (strings.startsWith(model, "ollama/")) {
+        var parts3: []string = strings.split(model, "/")
+        return parts3[1]
+    }
+    return model
+}
+
+// ─── Math Helpers ───────────────────────────────────────────────
+
+function _sqrt(x: float): float {
+    if (x <= 0.0) { return 0.0 }
+    var guess: float = x / 2.0
+    var i: int = 0
+    while (i < 30) {
+        guess = (guess + x / guess) / 2.0
+        i = i + 1
+    }
+    return guess
+}
+
+// ─── Provider Resolution ────────────────────────────────────────
+// Resolves model string + config into a fully-populated ResolvedConfig.
+// Auto-detects provider from model name, loads API keys from env.
+
+function _resolveConfig(config: EmbedConfig): ResolvedConfig {
+    var model: string = config.model
+    var provider: string = ""
+    var actualModel: string = model
+
+    // Explicit provider in config
+    if (config.provider != null) {
+        provider = config.provider
+    }
+
+    // Detect from prefix ("openai/text-embedding-3-small")
+    if (provider == "") {
+        if (strings.startsWith(model, "openai/")) {
+            provider = "openai"
+            actualModel = _stripPrefix(model)
+        }
+        if (provider == "" && strings.startsWith(model, "cohere/")) {
+            provider = "cohere"
+            actualModel = _stripPrefix(model)
+        }
+        if (provider == "" && strings.startsWith(model, "ollama/")) {
+            provider = "ollama"
+            actualModel = _stripPrefix(model)
+        }
+    }
+
+    // Auto-detect from model name pattern
+    if (provider == "") {
+        if (strings.startsWith(actualModel, "text-embedding-")) {
+            provider = "openai"
+        }
+    }
+    if (provider == "") {
+        if (strings.startsWith(actualModel, "embed-")) {
+            provider = "cohere"
+        }
+    }
+
+    // Default to ollama for unknown models (local-first)
+    if (provider == "") {
+        provider = "ollama"
+    }
+
+    // Resolve API key
+    var apiKey: string = ""
+    if (config.apiKey != null) {
+        apiKey = config.apiKey
+    } else if (provider == "openai" || provider == "cohere") {
+        // Only the key-based providers consult the environment. Ollama is local
+        // and needs no key. A missing .env file is non-fatal.
+        try {
+            dotenv.load()
+        } catch (e) {
+        }
+        if (provider == "openai") {
+            var envKey: any = dotenv.get("OPENAI_API_KEY")
+            if (envKey != null) {
+                apiKey = string(envKey)
+            }
+        }
+        if (provider == "cohere") {
+            var envKey2: any = dotenv.get("COHERE_API_KEY")
+            if (envKey2 != null) {
+                apiKey = string(envKey2)
+            }
+            if (apiKey == "") {
+                var envKey3: any = dotenv.get("CO_API_KEY")
+                if (envKey3 != null) {
+                    apiKey = string(envKey3)
+                }
+            }
+        }
+    }
+
+    // Base URL
+    var baseUrl: string = ""
+    if (config.baseUrl != null) {
+        baseUrl = config.baseUrl
+    } else {
+        if (provider == "openai") { baseUrl = "https://api.openai.com/v1" }
+        if (provider == "cohere") { baseUrl = "https://api.cohere.ai/v1" }
+        if (provider == "ollama") { baseUrl = "http://localhost:11434" }
+    }
+
+    // Batch size (texts per API call)
+    var batchSize: int = 100
+    if (config.batchSize != null) { batchSize = config.batchSize }
+
+    // Worker count (concurrent API calls)
+    var workers: int = 8
+    if (config.workers != null) { workers = config.workers }
+
+    // Optional dimension override (OpenAI supports truncated dimensions); 0 = none
+    var dimensions: int = 0
+    if (config.dimensions != null) { dimensions = config.dimensions }
+
+    // Cohere input_type: "search_document" or "search_query"
+    var inputType: string = "search_document"
+    if (config.inputType != null) { inputType = config.inputType }
+
+    var resolved: ResolvedConfig = {
+        provider: provider,
+        model: actualModel,
+        apiKey: apiKey,
+        baseUrl: baseUrl,
+        batchSize: batchSize,
+        workers: workers,
+        dimensions: dimensions,
+        inputType: inputType,
+    }
+    return resolved
+}
+
+// ─── Provider API Calls ─────────────────────────────────────────
+// Top-level async functions so they can be used with spawn.
+
+async function _callOpenAI(texts: []any, resolved: ResolvedConfig): Task<EmbedResponse> {
+    var payload: any = {
+        "model": resolved.model,
+        "input": texts,
+    }
+    if (resolved.dimensions != 0) {
+        payload.dimensions = resolved.dimensions
+    }
+
+    var resp: any = await http.post(
+        resolved.baseUrl + "/embeddings",
+        json.stringify(payload),
+        {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + resolved.apiKey,
+        }
+    )
+
+    var vectors: []any = []
+    if (resp.status != 200) {
+        println("OpenAI Embeddings error: " + string(resp.status) + " " + string(resp.body))
+        var errOut: EmbedResponse = { vectors: vectors, tokens: 0 }
+        return errOut
+    }
+
+    var data: any = json.parse(resp.body)
+    var rows: any = data.data
+    var n: int = rows.length
+    var i: int = 0
+    while (i < n) {
+        vectors.push(rows[i].embedding)
+        i = i + 1
+    }
+
+    var totalTokens: int = 0
+    if (data.usage != null) {
+        if (data.usage.total_tokens != null) {
+            totalTokens = data.usage.total_tokens
+        }
+    }
+
+    var out: EmbedResponse = { vectors: vectors, tokens: totalTokens }
+    return out
+}
+
+async function _callCohere(texts: []any, resolved: ResolvedConfig): Task<EmbedResponse> {
+    var payload: any = {
+        "model": resolved.model,
+        "texts": texts,
+        "input_type": resolved.inputType,
+    }
+
+    var resp: any = await http.post(
+        resolved.baseUrl + "/embed",
+        json.stringify(payload),
+        {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + resolved.apiKey,
+        }
+    )
+
+    var vectors: []any = []
+    if (resp.status != 200) {
+        println("Cohere Embeddings error: " + string(resp.status) + " " + string(resp.body))
+        var errOut: EmbedResponse = { vectors: vectors, tokens: 0 }
+        return errOut
+    }
+
+    var data: any = json.parse(resp.body)
+    var rows: any = data.embeddings
+    var n: int = rows.length
+    var i: int = 0
+    while (i < n) {
+        vectors.push(rows[i])
+        i = i + 1
+    }
+
+    var totalTokens: int = 0
+    if (data.meta != null) {
+        if (data.meta.billed_units != null) {
+            if (data.meta.billed_units.input_tokens != null) {
+                totalTokens = data.meta.billed_units.input_tokens
+            }
+        }
+    }
+
+    var out: EmbedResponse = { vectors: vectors, tokens: totalTokens }
+    return out
+}
+
+async function _callOllama(texts: []any, resolved: ResolvedConfig): Task<EmbedResponse> {
+    var payload: any = {
+        "model": resolved.model,
+        "input": texts,
+    }
+
+    var resp: any = await http.post(
+        resolved.baseUrl + "/api/embed",
+        json.stringify(payload),
+        { "Content-Type": "application/json" }
+    )
+
+    var vectors: []any = []
+    if (resp.status != 200) {
+        println("Ollama Embeddings error: " + string(resp.status) + " " + string(resp.body))
+        var errOut: EmbedResponse = { vectors: vectors, tokens: 0 }
+        return errOut
+    }
+
+    var data: any = json.parse(resp.body)
+    var rows: any = data.embeddings
+    var n: int = rows.length
+    var i: int = 0
+    while (i < n) {
+        vectors.push(rows[i])
+        i = i + 1
+    }
+
+    var out: EmbedResponse = { vectors: vectors, tokens: 0 }
+    return out
+}
+
+// ─── Core Embed Dispatch ────────────────────────────────────────
+
+async function _embedBatch(texts: []any, resolved: ResolvedConfig): Task<EmbedResponse> {
+    if (resolved.provider == "openai") {
+        return await _callOpenAI(texts, resolved)
+    }
+    if (resolved.provider == "cohere") {
+        return await _callCohere(texts, resolved)
+    }
+    if (resolved.provider == "ollama") {
+        return await _callOllama(texts, resolved)
+    }
+    var empty: EmbedResponse = { vectors: [], tokens: 0 }
+    return empty
+}
+
+// ─── Batch Worker (for spawn) ───────────────────────────────────
+// Executes one batch and sends result to channel with index for ordering.
+
+// Receives the resolved config as individual primitives so nothing shared/mutable
+// is handed across the spawn boundary; rebuilds a local ResolvedConfig.
+async function _batchWorker(
+    batch: []any,
+    provider: string,
+    model: string,
+    apiKey: string,
+    baseUrl: string,
+    dimensions: int,
+    inputType: string,
+    ch: Channel<WorkerMsg>,
+    index: int
+): Task<void> {
+    var resolved: ResolvedConfig = {
+        provider: provider,
+        model: model,
+        apiKey: apiKey,
+        baseUrl: baseUrl,
+        batchSize: 0,
+        workers: 0,
+        dimensions: dimensions,
+        inputType: inputType,
+    }
+    var result: EmbedResponse = await _embedBatch(batch, resolved)
+    var msg: WorkerMsg = { index: index, vectors: result.vectors, tokens: result.tokens }
+    ch.send(msg)
+    return
+}
+
+// ─── EmbedModule ────────────────────────────────────────────────
+// The entry point. Import and use immediately:
+//
+//   import { embed } from "pkg/chuks_embed"
+//   var vec = await embed.single("Hello world", { model: "text-embedding-3-small" })
+
+class EmbedModule {
+
+    // ── Embed a single text ─────────────────────────────────
+    // Returns the embedding vector ([]any of floats).
+    //
+    //   var vec = await embed.single("Hello world", { model: "text-embedding-3-small" })
+    public async single(text: string, config: EmbedConfig?): Task<any> {
+        if (config == null) { return null }
+        var resolved: ResolvedConfig = _resolveConfig(config)
+        var result: EmbedResponse = await _embedBatch([text], resolved)
+        if (result.vectors.length > 0) {
+            return result.vectors[0]
+        }
+        return null
+    }
+
+    // ── Embed an array in a single API call ─────────────────
+    // Good for small batches. For large datasets, use batchParallel.
+    //
+    //   var emb = await embed.batch(["text1", "text2"], { model: "text-embedding-3-small" })
+    //   emb.vectors[0]  // vector for "text1"
+    public async batch(texts: []any, config: EmbedConfig?): Task<EmbeddingResult> {
+        if (config == null) {
+            var none: EmbeddingResult = { vectors: [], model: "", dimensions: 0, totalTokens: 0 }
+            return none
+        }
+        var resolved: ResolvedConfig = _resolveConfig(config)
+        var result: EmbedResponse = await _embedBatch(texts, resolved)
+        var dims: int = 0
+        if (result.vectors.length > 0) {
+            var first: any = result.vectors[0]
+            dims = first.length
+        }
+        var out: EmbeddingResult = {
+            vectors: result.vectors,
+            model: resolved.model,
+            dimensions: dims,
+            totalTokens: result.tokens,
+        }
+        return out
+    }
+
+    // ── The killer feature: parallel batch embedding ────────
+    // Splits texts into batches, processes `workers` batches simultaneously
+    // across real CPU cores via spawn + channels.
+    //
+    // On a 16-core machine with workers: 16, this fires 16 API calls at once.
+    // 1 million documents → minutes instead of hours.
+    //
+    //   var result = await embed.batchParallel(docs, {
+    //       model: "text-embedding-3-small", batchSize: 100, workers: 16
+    //   })
+    public async batchParallel(texts: []any, config: EmbedConfig?): Task<BatchResult> {
+        if (config == null) {
+            var none: BatchResult = { vectors: [], model: "", dimensions: 0, totalTokens: 0, batchCount: 0, duration: 0 }
+            return none
+        }
+        var startTime: int = time.now()
+        var resolved: ResolvedConfig = _resolveConfig(config)
+        var batchSize: int = resolved.batchSize
+        var workers: int = resolved.workers
+        var totalTexts: int = texts.length
+
+        // Progress callback (optional)
+        var onProgress: ((int, int) => void)? = null
+        if (config.onProgress != null) {
+            onProgress = config.onProgress
+        }
+
+        // ── Split texts into batches ────────────────────────
+        var batches: []any = []
+        var bi: int = 0
+        while (bi < totalTexts) {
+            var bEnd: int = bi + batchSize
+            if (bEnd > totalTexts) {
+                bEnd = totalTexts
+            }
+            var batch: []any = []
+            var bj: int = 0
+            while (bj < bEnd - bi) {
+                batch.push(texts[bi + bj])
+                bj = bj + 1
+            }
+            batches.push(batch)
+            bi = bEnd
+        }
+
+        var totalBatches: int = batches.length
+        var allVectors: []any = []
+        var totalTokens: int = 0
+        var batchIdx: int = 0
+        var completedBatches: int = 0
+
+        // ── Process batches in groups of `workers` ──────────
+        while (batchIdx < totalBatches) {
+            // How many workers in this group
+            var groupSize: int = workers
+            if (batchIdx + groupSize > totalBatches) {
+                groupSize = totalBatches - batchIdx
+            }
+
+            var ch: Channel<WorkerMsg> = new Channel<WorkerMsg>(groupSize)
+
+            // Spawn all workers for this group — real OS threads
+            var wi: int = 0
+            while (wi < groupSize) {
+                spawn _batchWorker(batches[batchIdx + wi], resolved.provider, resolved.model, resolved.apiKey, resolved.baseUrl, resolved.dimensions, resolved.inputType, ch, wi)
+                wi = wi + 1
+            }
+
+            // Pre-fill ordered results for this group
+            var groupResults: []any = []
+            var gk: int = 0
+            while (gk < groupSize) {
+                groupResults.push(null)
+                gk = gk + 1
+            }
+
+            // Collect all results (may arrive out of order)
+            var gi: int = 0
+            while (gi < groupSize) {
+                var msg: WorkerMsg? = ch.receive()
+                if (msg == null) { break }
+                groupResults[msg.index] = msg
+                gi = gi + 1
+            }
+            ch.close()
+
+            // Flatten into allVectors in correct order
+            var gj: int = 0
+            while (gj < groupSize) {
+                var gr: WorkerMsg = groupResults[gj]
+                totalTokens = totalTokens + gr.tokens
+                var grVecs: []any = gr.vectors
+                var vk: int = 0
+                while (vk < grVecs.length) {
+                    allVectors.push(grVecs[vk])
+                    vk = vk + 1
+                }
+                gj = gj + 1
+            }
+
+            completedBatches = completedBatches + groupSize
+            batchIdx = batchIdx + groupSize
+
+            // Fire progress callback
+            if (onProgress != null) {
+                onProgress(completedBatches, totalBatches)
+            }
+        }
+
+        var dims: int = 0
+        if (allVectors.length > 0) {
+            var first: any = allVectors[0]
+            dims = first.length
+        }
+        var elapsed: int = time.now() - startTime
+
+        var out: BatchResult = {
+            vectors: allVectors,
+            model: resolved.model,
+            dimensions: dims,
+            totalTokens: totalTokens,
+            batchCount: totalBatches,
+            duration: elapsed,
+        }
+        return out
+    }
+
+    // ── Cosine similarity ───────────────────────────────────
+    // Returns a value between -1 and 1. 1 = identical meaning.
+    //
+    //   var score = embed.similarity(vecA, vecB)
+    public similarity(a: any, b: any): float {
+        var dot: float = 0.0
+        var magA: float = 0.0
+        var magB: float = 0.0
+        var i: int = 0
+        var len: int = a.length
+        while (i < len) {
+            var av: float = a[i]
+            var bv: float = b[i]
+            dot = dot + av * bv
+            magA = magA + av * av
+            magB = magB + bv * bv
+            i = i + 1
+        }
+        var denom: float = _sqrt(magA) * _sqrt(magB)
+        if (denom == 0.0) { return 0.0 }
+        return dot / denom
+    }
+
+    // ── Dot product ─────────────────────────────────────────
+    // Fast similarity for pre-normalized vectors.
+    //
+    //   var score = embed.dotProduct(normA, normB)
+    public dotProduct(a: any, b: any): float {
+        var result: float = 0.0
+        var i: int = 0
+        var len: int = a.length
+        while (i < len) {
+            var av: float = a[i]
+            var bv: float = b[i]
+            result = result + av * bv
+            i = i + 1
+        }
+        return result
+    }
+
+    // ── Normalize vector to unit length ─────────────────────
+    // Pre-normalizing allows using dotProduct instead of similarity (faster).
+    //
+    //   var norm = embed.normalize(vec)
+    //   var score = embed.dotProduct(norm, otherNorm)
+    public normalize(vector: any): []float {
+        var magnitude: float = 0.0
+        var i: int = 0
+        var len: int = vector.length
+        while (i < len) {
+            var x: float = vector[i]
+            magnitude = magnitude + x * x
+            i = i + 1
+        }
+        magnitude = _sqrt(magnitude)
+        var result: []float = []
+        if (magnitude == 0.0) {
+            var z: int = 0
+            while (z < len) {
+                var zx: float = vector[z]
+                result.push(zx)
+                z = z + 1
+            }
+            return result
+        }
+        var j: int = 0
+        while (j < len) {
+            var jx: float = vector[j]
+            result.push(jx / magnitude)
+            j = j + 1
+        }
+        return result
+    }
+
+    // ── Dimension lookup ────────────────────────────────────
+    // Returns the known dimension count for a model.
+    // Returns 0 if the model is not in the built-in table.
+    //
+    //   embed.dimensions("text-embedding-3-small")    // → 1536
+    //   embed.dimensions("ollama/nomic-embed-text")   // → 768
+    public dimensions(model: string): int {
+        return _getDimensions(_stripPrefix(model))
+    }
+
+    // ── Find most similar documents ─────────────────────────
+    // Embeds the query and all documents, returns indices ranked by similarity.
+    // For production use, pre-compute document embeddings and use similarity() directly.
+    //
+    //   var matches = await embed.search("what is AI?", docs, {
+    //       model: "text-embedding-3-small", topK: 5
+    //   })
+    //   matches[0].index     // index of most similar doc
+    //   matches[0].score     // cosine similarity score
+    public async search(query: string, documents: []any, config: EmbedConfig?): Task<[]any> {
+        var results: []any = []
+        if (config == null) { return results }
+        var resolved: ResolvedConfig = _resolveConfig(config)
+        var topK: int = 10
+        if (config.topK != null) { topK = config.topK }
+
+        // Embed query (use "search_query" for Cohere)
+        var queryConfig: EmbedConfig = {
+            model: config.model,
+            apiKey: resolved.apiKey,
+            baseUrl: resolved.baseUrl,
+            provider: resolved.provider,
+            inputType: "search_query",
+        }
+        var queryResolved: ResolvedConfig = _resolveConfig(queryConfig)
+        var queryResult: EmbedResponse = await _embedBatch([query], queryResolved)
+        if (queryResult.vectors.length == 0) {
+            return results
+        }
+        var queryVec: any = queryResult.vectors[0]
+
+        // Embed documents in parallel
+        var docResult: BatchResult = await this.batchParallel(documents, config)
+
+        // Compute similarity scores
+        var scores: []SearchHit = []
+        var docVecs: []any = docResult.vectors
+        var i: int = 0
+        while (i < docVecs.length) {
+            var score: float = this.similarity(queryVec, docVecs[i])
+            scores.push({ index: i, score: score })
+            i = i + 1
+        }
+
+        // Sort by score descending (insertion sort)
+        var si: int = 1
+        while (si < scores.length) {
+            var current: SearchHit = scores[si]
+            var sj: int = si - 1
+            var sorting: bool = true
+            while (sorting) {
+                if (sj < 0) {
+                    sorting = false
+                } else {
+                    if (scores[sj].score < current.score) {
+                        scores[sj + 1] = scores[sj]
+                        sj = sj - 1
+                    } else {
+                        sorting = false
+                    }
+                }
+            }
+            scores[sj + 1] = current
+            si = si + 1
+        }
+
+        // Return top K
+        var ri: int = 0
+        while (ri < topK) {
+            if (ri >= scores.length) {
+                ri = topK
+            } else {
+                results.push(scores[ri])
+                ri = ri + 1
+            }
+        }
+        return results
+    }
+}
+
+// ─── Singleton Export ───────────────────────────────────────────
+
+const embed = new EmbedModule()
+
+export {
+    embed,
+    EmbedModule,
+    EmbedConfig,
+    EmbeddingResult,
+    BatchResult,
+    SearchHit
+}

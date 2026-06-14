@@ -1,0 +1,199 @@
+import { test } from "std/test"
+import { embed } from "../src/index.chuks"
+
+var passed: int = 0
+var failed: int = 0
+var failures: []string = []
+
+function pass(label: string): void {
+    passed = passed + 1
+    println("  PASS: " + label)
+}
+
+function fail(label: string, detail: string): void {
+    failed = failed + 1
+    failures.push("FAIL: " + label + " — " + detail)
+    println("  FAIL: " + label + " — " + detail)
+}
+
+function assertApprox(actual: any, expected: any, epsilon: any, label: string): void {
+    var diff: any = actual - expected
+    if (diff < 0) { diff = diff * -1 }
+    if (diff > epsilon) {
+        fail(label, "expected ~" + string(expected) + ", got " + string(actual))
+        return
+    }
+    pass(label)
+}
+
+// ─── Dimension Lookup Tests ─────────────────────────────────────
+
+function testDimensionOpenAISmall(): void {
+    var dims: int = embed.dimensions("text-embedding-3-small")
+    if (dims == 1536) { pass("dimensions: text-embedding-3-small → 1536") }
+    else { fail("dimensions: text-embedding-3-small", "expected 1536, got " + string(dims)) }
+}
+
+function testDimensionOpenAILarge(): void {
+    var dims: int = embed.dimensions("text-embedding-3-large")
+    if (dims == 3072) { pass("dimensions: text-embedding-3-large → 3072") }
+    else { fail("dimensions: text-embedding-3-large", "expected 3072, got " + string(dims)) }
+}
+
+function testDimensionCohere(): void {
+    var dims: int = embed.dimensions("embed-english-v3.0")
+    if (dims == 1024) { pass("dimensions: embed-english-v3.0 → 1024") }
+    else { fail("dimensions: embed-english-v3.0", "expected 1024, got " + string(dims)) }
+}
+
+function testDimensionOllama(): void {
+    var dims: int = embed.dimensions("nomic-embed-text")
+    if (dims == 768) { pass("dimensions: nomic-embed-text → 768") }
+    else { fail("dimensions: nomic-embed-text", "expected 768, got " + string(dims)) }
+}
+
+function testDimensionWithPrefix(): void {
+    var dims: int = embed.dimensions("openai/text-embedding-3-small")
+    if (dims == 1536) { pass("dimensions: openai/ prefix stripped → 1536") }
+    else { fail("dimensions: openai/ prefix", "expected 1536, got " + string(dims)) }
+}
+
+function testDimensionOllamaPrefix(): void {
+    var dims: int = embed.dimensions("ollama/nomic-embed-text")
+    if (dims == 768) { pass("dimensions: ollama/ prefix stripped → 768") }
+    else { fail("dimensions: ollama/ prefix", "expected 768, got " + string(dims)) }
+}
+
+function testDimensionUnknown(): void {
+    var dims: int = embed.dimensions("totally-unknown-model")
+    if (dims == 0) { pass("dimensions: unknown model → 0") }
+    else { fail("dimensions: unknown model", "expected 0, got " + string(dims)) }
+}
+
+// ─── Similarity Tests ───────────────────────────────────────────
+
+function testSimilarityIdentical(): void {
+    var vec: []any = [1.0, 2.0, 3.0, 4.0, 5.0]
+    var score: any = embed.similarity(vec, vec)
+    assertApprox(score, 1.0, 0.001, "similarity: identical vectors → ~1.0")
+}
+
+function testSimilarityOrthogonal(): void {
+    var a: []any = [1.0, 0.0, 0.0]
+    var b: []any = [0.0, 1.0, 0.0]
+    var score: any = embed.similarity(a, b)
+    assertApprox(score, 0.0, 0.001, "similarity: orthogonal vectors → ~0.0")
+}
+
+function testSimilarityOpposite(): void {
+    var a: []any = [1.0, 2.0, 3.0]
+    var b: []any = [-1.0, -2.0, -3.0]
+    var score: any = embed.similarity(a, b)
+    assertApprox(score, -1.0, 0.001, "similarity: opposite vectors → ~-1.0")
+}
+
+function testSimilaritySimilar(): void {
+    var a: []any = [1.0, 2.0, 3.0]
+    var b: []any = [1.0, 2.0, 4.0]
+    var score: any = embed.similarity(a, b)
+    // Should be high but not 1.0
+    if (score > 0.9) { pass("similarity: similar vectors > 0.9") }
+    else { fail("similarity: similar vectors", "expected > 0.9, got " + string(score)) }
+}
+
+function testSimilarityZeroVector(): void {
+    var a: []any = [0.0, 0.0, 0.0]
+    var b: []any = [1.0, 2.0, 3.0]
+    var score: any = embed.similarity(a, b)
+    assertApprox(score, 0.0, 0.001, "similarity: zero vector → 0.0")
+}
+
+// ─── Dot Product Tests ──────────────────────────────────────────
+
+function testDotProduct(): void {
+    var a: []any = [1.0, 2.0, 3.0]
+    var b: []any = [4.0, 5.0, 6.0]
+    // 1*4 + 2*5 + 3*6 = 4 + 10 + 18 = 32
+    var result: any = embed.dotProduct(a, b)
+    assertApprox(result, 32.0, 0.001, "dotProduct: [1,2,3]·[4,5,6] → 32")
+}
+
+function testDotProductOrthogonal(): void {
+    var a: []any = [1.0, 0.0]
+    var b: []any = [0.0, 1.0]
+    var result: any = embed.dotProduct(a, b)
+    assertApprox(result, 0.0, 0.001, "dotProduct: orthogonal → 0")
+}
+
+// ─── Normalize Tests ────────────────────────────────────────────
+
+function testNormalize(): void {
+    var vec: []any = [3.0, 4.0]
+    var norm: any = embed.normalize(vec)
+    // Magnitude should be 5, so norm = [0.6, 0.8]
+    assertApprox(norm[0], 0.6, 0.001, "normalize: [3,4] → [0.6, ...]")
+    assertApprox(norm[1], 0.8, 0.001, "normalize: [3,4] → [..., 0.8]")
+}
+
+function testNormalizedDotProduct(): void {
+    var a: []any = [3.0, 4.0]
+    var b: []any = [3.0, 4.0]
+    var normA: any = embed.normalize(a)
+    var normB: any = embed.normalize(b)
+    // Dot product of identical normalized vectors = 1.0
+    var score: any = embed.dotProduct(normA, normB)
+    assertApprox(score, 1.0, 0.001, "normalize + dotProduct: identical → 1.0")
+}
+
+function testNormalizeZero(): void {
+    var vec: []any = [0.0, 0.0, 0.0]
+    var norm: any = embed.normalize(vec)
+    // Should return original (can't normalize zero vector)
+    assertApprox(norm[0], 0.0, 0.001, "normalize: zero vector unchanged")
+}
+
+// ─── Module Existence ───────────────────────────────────────────
+
+function testModuleExists(): void {
+    if (embed != null) { pass("embed module is not null") }
+    else { fail("embed module", "embed is null") }
+}
+
+// ─── Main ───────────────────────────────────────────────────────
+
+async function main(): Task<void> {
+    var start: any = test.now()
+    println("chuks_embed test suite")
+    println("══════════════════════════════════════════")
+
+    testModuleExists()
+
+    println("\n── Dimension Lookup ──")
+    testDimensionOpenAISmall()
+    testDimensionOpenAILarge()
+    testDimensionCohere()
+    testDimensionOllama()
+    testDimensionWithPrefix()
+    testDimensionOllamaPrefix()
+    testDimensionUnknown()
+
+    println("\n── Cosine Similarity ──")
+    testSimilarityIdentical()
+    testSimilarityOrthogonal()
+    testSimilarityOpposite()
+    testSimilaritySimilar()
+    testSimilarityZeroVector()
+
+    println("\n── Dot Product ──")
+    testDotProduct()
+    testDotProductOrthogonal()
+
+    println("\n── Normalize ──")
+    testNormalize()
+    testNormalizedDotProduct()
+    testNormalizeZero()
+
+    println("══════════════════════════════════════════")
+    var elapsed: any = test.now() - start
+    test.report(passed, failed, failures, elapsed)
+}

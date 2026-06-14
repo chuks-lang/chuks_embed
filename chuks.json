@@ -1,0 +1,11 @@
+{
+  "name": "@chuks/embed",
+  "version": "1.0.0",
+  "description": "High-throughput embedding engine for Chuks, batch parallel embedding across CPU cores with OpenAI, Cohere, and Ollama providers",
+  "entry": "src/index.chuks",
+  "author": "Chuks Team",
+  "license": "MIT",
+  "keywords": ["embedding", "vector", "ai", "parallel", "batch", "openai", "cohere", "ollama", "rag", "semantic-search"],
+  "repository": "https://github.com/chuks-lang/chuks_embed",
+  "dependencies": {}
+}
